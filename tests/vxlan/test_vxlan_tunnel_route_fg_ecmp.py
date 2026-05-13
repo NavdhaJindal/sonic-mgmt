@@ -162,13 +162,11 @@ def set_route_tunnel_with_mac_vni(duthost, endpoints, mac_list, vni):
     time.sleep(3)
 
 
-def cleanup(duthost, ptfhost, ptf_port_name):
+def cleanup(duthost, ptfhost):
     duthost.shell(f"mv {CONFIG_DB_PATH}.bak {CONFIG_DB_PATH}")
     config_reload(duthost, safe_reload=True, check_intf_up_ports=True)
     for f in [PERSIST_MAP_FILE, PTF_PARAMS_FILE, PTF_LOG_FILE]:
         ptfhost.shell(f"rm -f {f}")
-    if ptf_port_name:
-        ptfhost.shell(f"ip addr flush dev {ptf_port_name}")
 
 
 def vxlan_setup_one_vnet(duthost, ptfhost, tbinfo, cfg_facts,
@@ -207,8 +205,6 @@ def vxlan_setup_one_vnet(duthost, ptfhost, tbinfo, cfg_facts,
     )
 
     ptf_ip = "201.0.1.101"
-    ptfhost.shell(f"ip addr flush dev {ptf_port_name}")
-    ptfhost.shell(f"ip addr add {ptf_ip}/24 dev {ptf_port_name}")
     ptfhost.shell(f"ip link set {ptf_port_name} up")
 
     ecmp_utils.configure_vxlan_switch(duthost, vxlan_port=vxlan_port,
@@ -256,8 +252,6 @@ def setup_second_vnet(duthost, ptfhost, tbinfo, config_facts, dut_indx, first_in
     ptf_port_index2 = port_indexes[ingress_if2]
     ptf_port_name2 = ptf_ports_available_in_topo[ptf_port_index2]
 
-    ptfhost.shell(f"ip addr flush dev {ptf_port_name2}")
-    ptfhost.shell(f"ip addr add {VNET2_PTF_IP}/24 dev {ptf_port_name2}")
     ptfhost.shell(f"ip link set {ptf_port_name2} up")
 
     vnet2_endpoints = generate_endpoint_list(VNET2_ENDPOINT_BASE_IP, NUM_INITIAL_ENDPOINTS)
@@ -311,11 +305,7 @@ def common_setup_teardown(
         pytest.fail("Vnet testing setup failed")
 
     finally:
-        ptf_port_name = (setup_params or {}).get("ptf_port_name", "")
-        vnet2_ptf_port_name = ((setup_params or {}).get("vnet2") or {}).get("ptf_port_name", "")
-        cleanup(duthost, ptfhost, ptf_port_name)
-        if vnet2_ptf_port_name:
-            ptfhost.shell(f"ip addr flush dev {vnet2_ptf_port_name}")
+        cleanup(duthost, ptfhost)
 
 
 def run_regular_ecmp_ptf_test(ptfhost, endpoints, params, num_packets):
@@ -366,7 +356,7 @@ def run_vxlan_ptf_test(ptfhost, endpoints, params, test_case, num_packets, **kwa
     ptf_runner(
         ptfhost,
         "ptftests",
-        "vxlan_tunnel_route_fg_ecmp_test.VxlanTunnelFgEcmpTest",
+        "vxlan_tunnel_fg_ecmp_test.VxlanTunnelFgEcmpTest",
         platform_dir="ptftests",
         params={"params_file": PTF_PARAMS_FILE},
         log_file=PTF_LOG_FILE,
@@ -402,13 +392,32 @@ def test_vxlan_fg_ecmp(ptfhost, common_setup_teardown):
         num_packets=NUM_FLOWS, add_endpoint=new_endpoint,
     )
 
+    # Simultaneously remove 2 endpoints and add 2 new ones. Total endpoint
+    # count is unchanged so the bucket layout stays the same; flows on
+    # unchanged endpoints must remain on the same endpoint, and only flows
+    # whose previous endpoint was withdrawn may redistribute.
+    withdrawn_endpoints = readded_endpoints[:2]
+    kept_endpoints = readded_endpoints[2:]
+    added_endpoints = [
+        f"{ENDPOINT_BASE_IP}{NUM_INITIAL_ENDPOINTS + 1}",  # 100.0.1.11
+        f"{ENDPOINT_BASE_IP}{NUM_INITIAL_ENDPOINTS + 2}",  # 100.0.1.12
+    ]
+    swapped_endpoints = kept_endpoints + added_endpoints
+    set_route_tunnel(duthost, swapped_endpoints)
+    run_vxlan_ptf_test(
+        ptfhost, swapped_endpoints, setup, "swap_endpoints",
+        num_packets=NUM_FLOWS,
+        withdrawn_endpoints=withdrawn_endpoints,
+        added_endpoints=added_endpoints,
+    )
+
     vnet2 = setup["vnet2"]
     vnet2_endpoints = generate_endpoint_list(VNET2_ENDPOINT_BASE_IP, NUM_INITIAL_ENDPOINTS)
     run_vxlan_ptf_test(
         ptfhost,
         endpoints,  # Vnet1 endpoints
         setup,
-        "dual_vnet_isolation",
+        "conflicting_dest_prefix",
         num_packets=NUM_FLOWS,
         vnet2_endpoints=vnet2_endpoints,
         ptf_ingress_port_vnet2=vnet2["ptf_ingress_port"],

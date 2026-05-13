@@ -11,6 +11,11 @@ Test cases:
   endpoints are completely undisturbed
 - add_endpoint: Replay flows after a new endpoint is added. Asserts that at
   most 12% of flows migrate to the new endpoint
+- swap_endpoints: Replay flows after N endpoints are simultaneously removed and
+  N new endpoints are added. Asserts that flows previously going to unchanged
+  endpoints stay on the exact same endpoint (no collateral disruption), flows
+  on withdrawn endpoints redistribute to any current endpoint, and that every
+  newly added endpoint receives at least one flow.
 - conflicting_dest_prefix: Send flows from two separate VNET ingress ports that both
   have the same destination prefix but different VNIs. Asserts that Vnet1 flows
   reach only Vnet1 endpoints and Vnet2 flows reach only Vnet2 endpoints
@@ -70,6 +75,14 @@ class VxlanTunnelFgEcmpTest(BaseTest):
 
         self.withdraw_endpoint = params.get("withdraw_endpoint") if self.test_case == "withdraw_endpoint" else None
         self.add_endpoint = params.get("add_endpoint") if self.test_case == "add_endpoint" else None
+
+        # swap_endpoints params: lists of simultaneously withdrawn / added endpoints
+        self.withdrawn_endpoints = (
+            params.get("withdrawn_endpoints", []) if self.test_case == "swap_endpoints" else []
+        )
+        self.added_endpoints = (
+            params.get("added_endpoints", []) if self.test_case == "swap_endpoints" else []
+        )
 
         self.vnet2_endpoints = params.get("vnet2_endpoints")
         _port2 = params.get("ptf_ingress_port_vnet2")
@@ -278,10 +291,10 @@ class VxlanTunnelFgEcmpTest(BaseTest):
         for flow_key, expected in flow_map[self.dst_ip].items():
             sport, dport = map(int, flow_key.split(":"))
             actual = self._send_and_capture_endpoint(sport, dport)
-            if actual is not None:
-                flows_checked += 1
-                if actual != expected:
-                    mismatches.append((flow_key, expected, actual))
+            assert actual is not None, f"No response for flow {flow_key}"
+            flows_checked += 1
+            if actual != expected:
+                mismatches.append((flow_key, expected, actual))
             if flows_checked % 100 == 0:
                 logger.info(f"  checked {flows_checked} flows, {len(mismatches)} mismatches so far")
 
@@ -377,6 +390,69 @@ class VxlanTunnelFgEcmpTest(BaseTest):
             f"Too many flows disrupted by adding endpoint {self.add_endpoint}: "
             f"{moved_to_new}/{total} = {disruption_rate:.1%} "
             f"(threshold: {MAX_DEVIATION:.0%})"
+        )
+
+    def _swap_endpoints(self, flow_map):
+        """
+        After N endpoints are simultaneously removed and N new endpoints are
+        added (with the total endpoint count unchanged):
+        - No flow may hit any withdrawn endpoint.
+        - Flows whose previous endpoint is unchanged (still in self.endpoints)
+          must stay on the exact same endpoint -- no collateral disruption.
+        - Flows whose previous endpoint was withdrawn may move to any current
+          endpoint (existing or newly added).
+        - Every newly added endpoint must receive at least one flow.
+        """
+        assert self.withdrawn_endpoints, "withdrawn_endpoints param is required"
+        assert self.added_endpoints, "added_endpoints param is required"
+
+        withdrawn_set = set(self.withdrawn_endpoints)
+        added_set = set(self.added_endpoints)
+        current_set = set(self.endpoints)
+
+        redistributed = 0
+        added_hits = {ep: 0 for ep in self.added_endpoints}
+        collateral = []
+        self.tcp_sport = 1234
+        self.tcp_dport = 5000
+
+        for flow_key, old_endpoint in flow_map[self.dst_ip].items():
+            sport, dport = map(int, flow_key.split(":"))
+            new_endpoint = self._send_and_capture_endpoint(sport, dport)
+
+            assert new_endpoint is not None, f"No response for flow {flow_key}"
+            assert new_endpoint not in withdrawn_set, (
+                f"Flow {flow_key} still hitting withdrawn endpoint {new_endpoint}"
+            )
+            assert new_endpoint in current_set, (
+                f"Flow {flow_key} hit endpoint {new_endpoint} not in current set {current_set}"
+            )
+
+            if old_endpoint in withdrawn_set:
+                redistributed += 1
+                flow_map[self.dst_ip][flow_key] = new_endpoint
+            elif new_endpoint != old_endpoint:
+                collateral.append((flow_key, old_endpoint, new_endpoint))
+
+            if new_endpoint in added_set:
+                added_hits[new_endpoint] += 1
+
+        logger.info(
+            f"Swap result: {redistributed} flows redistributed from withdrawn "
+            f"endpoints {sorted(withdrawn_set)}; added endpoint hits={added_hits}; "
+            f"collateral disruptions={len(collateral)}"
+        )
+
+        assert not collateral, (
+            f"{len(collateral)} flow(s) on unchanged endpoints were collaterally "
+            f"disrupted (only flows on withdrawn endpoints {sorted(withdrawn_set)} "
+            f"should move). First few: " +
+            "; ".join(f"flow={k} {o}->{n}" for k, o, n in collateral[:5])
+        )
+
+        missing_added = [ep for ep, c in added_hits.items() if c == 0]
+        assert not missing_added, (
+            f"Newly added endpoint(s) received no flows: {missing_added}"
         )
 
     def _verify_mac_vni(self):
@@ -566,6 +642,10 @@ class VxlanTunnelFgEcmpTest(BaseTest):
 
         elif self.test_case == "add_endpoint":
             self._add_endpoint(flow_map)
+            self._save_persist_map(flow_map)
+
+        elif self.test_case == "swap_endpoints":
+            self._swap_endpoints(flow_map)
             self._save_persist_map(flow_map)
 
         else:
