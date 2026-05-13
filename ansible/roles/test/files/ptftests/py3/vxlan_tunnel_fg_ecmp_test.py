@@ -234,7 +234,10 @@ class VxlanTunnelFgEcmpTest(BaseTest):
         deviation_max = 0.0
         for endpoint, exp_flows in self.exp_flow_count.items():
             actual = hit_count_map.get(endpoint, 0)
-            deviation = abs(1.0 - actual / float(exp_flows))
+            if exp_flows == 0:
+                deviation = float('inf') if actual else 0.0
+            else:
+                deviation = abs(1.0 - actual / float(exp_flows))
             logger.info(
                 f"  endpoint={endpoint}  expected={exp_flows:.1f}  "
                 f"actual={actual}  deviation={deviation:.3f}"
