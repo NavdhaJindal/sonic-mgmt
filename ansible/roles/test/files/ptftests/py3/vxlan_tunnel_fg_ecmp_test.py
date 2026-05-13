@@ -71,6 +71,14 @@ class VxlanTunnelFgEcmpTest(BaseTest):
         self.vxlan_port = int(params.get("vxlan_port", 4789))
         self.send_port = int(params.get("ptf_ingress_port", 0))
         self.exp_flow_count = params.get("exp_flow_count", {})
+        # Strict assertion: every configured endpoint must receive >=1 flow.
+        # Disabled by the scale tests where the flow:endpoint ratio is too
+        # low for that to hold reliably.
+        self.require_all_endpoints_hit = bool(params.get("require_all_endpoints_hit", True))
+        # Endpoints that must NOT receive any traffic (used by
+        # verify_endpoint_unreachable to prove a route update was rejected by
+        # the hardware).
+        self.forbidden_endpoints = params.get("forbidden_endpoints", [])
         self.persist_map = params.get("persist_map", "/tmp/vxlan_tunnel_fg_ecmp_persist_map.json")
 
         self.withdraw_endpoint = params.get("withdraw_endpoint") if self.test_case == "withdraw_endpoint" else None
@@ -94,6 +102,10 @@ class VxlanTunnelFgEcmpTest(BaseTest):
         self.expected_vni = int(_expected_vni) if _expected_vni is not None else None
         # endpoint_to_mac is a dict {endpoint_ip: mac_string} (lowercase MACs preferred)
         self.endpoint_to_mac = params.get("endpoint_to_mac", {})
+
+        # PTF port indices the DUT may legitimately egress VXLAN-encap traffic on
+        # (i.e. T1-facing uplinks). Empty list disables the egress-port check.
+        self.expected_egress_ports = [int(p) for p in params.get("expected_egress_ports", [])]
 
         self.tcp_sport = 1234
         self.tcp_dport = 5000
@@ -147,6 +159,15 @@ class VxlanTunnelFgEcmpTest(BaseTest):
                         continue
             except Exception:
                 continue
+
+            # Packet matches our flow -- now verify it egressed on an expected
+            # PTF port (mirrors verify_packet_any_port semantics).
+            if self.expected_egress_ports and result.port not in self.expected_egress_ports:
+                raise AssertionError(
+                    f"VXLAN-encap packet for flow sport={sport} dport={dport} "
+                    f"received on PTF port {result.port}, expected one of "
+                    f"{self.expected_egress_ports}"
+                )
 
             outer_dst = ether[scapy.IP].dst
             return outer_dst if outer_dst in valid_endpoints else None
@@ -258,11 +279,20 @@ class VxlanTunnelFgEcmpTest(BaseTest):
             total = len(flow_map[self.dst_ip])
             logger.info(f"Attempt {attempt + 1}: {total} flows captured. Distribution: {hit_count_map}")
 
-            assert set(self.endpoints) == set(hit_count_map.keys()), (
-                f"Not all endpoints were reached.\n"
-                f"  Expected: {sorted(self.endpoints)}\n"
-                f"  Got:      {sorted(hit_count_map.keys())}"
-            )
+            if self.require_all_endpoints_hit:
+                assert set(self.endpoints) == set(hit_count_map.keys()), (
+                    f"Not all endpoints were reached.\n"
+                    f"  Expected: {sorted(self.endpoints)}\n"
+                    f"  Got:      {sorted(hit_count_map.keys())}"
+                )
+            else:
+                # Still validate that no traffic landed on an unknown
+                # endpoint -- only relax the all-hit requirement.
+                stray = set(hit_count_map.keys()) - set(self.endpoints)
+                assert not stray, (
+                    f"Flows landed on endpoints not in configured set: {sorted(stray)}"
+                )
+                assert total > 0, "No flows were captured at all"
 
             if not self.exp_flow_count:
                 break
@@ -507,6 +537,12 @@ class VxlanTunnelFgEcmpTest(BaseTest):
                     logger.error(f"Received VXLAN pkt to unexpected endpoint {outer_dst}")
                     continue
 
+                if self.expected_egress_ports and res.port not in self.expected_egress_ports:
+                    raise AssertionError(
+                        f"VXLAN-encap packet to {outer_dst} received on PTF port "
+                        f"{res.port}, expected one of {self.expected_egress_ports}"
+                    )
+
                 expected_mac = endpoint_to_mac_norm[outer_dst]
                 exp = self._build_expected_for_endpoint(
                     inner, outer_dst, self.expected_vni, expected_mac,
@@ -548,6 +584,65 @@ class VxlanTunnelFgEcmpTest(BaseTest):
         )
         missing = [ep for ep, c in endpoint_hits.items() if c == 0]
         assert not missing, f"No packets observed for endpoints: {missing}"
+
+    def _verify_endpoint_unreachable(self):
+        """
+        Send num_packets distinct flows and assert that none of
+        self.forbidden_endpoints receive any traffic, while at least one
+        flow successfully lands on a non-forbidden configured endpoint.
+
+        Used to confirm that an attempted route update was rejected at the
+        hardware layer (e.g. exceeding the FG ECMP bucket-count cap): the
+        new endpoint appears in CONFIG_DB but never in the actual
+        forwarding decision.
+        """
+        assert self.forbidden_endpoints, "forbidden_endpoints param is required"
+
+        forbidden_set = set(self.forbidden_endpoints)
+        valid_set = set(self.endpoints) - forbidden_set
+        assert valid_set, (
+            "All configured endpoints are in forbidden_endpoints; "
+            "nothing left to forward to"
+        )
+
+        forbidden_hits = {ep: 0 for ep in self.forbidden_endpoints}
+        valid_hits = 0
+        no_response = 0
+
+        self.tcp_sport = 1234
+        self.tcp_dport = 5000
+
+        for i in range(self.num_packets):
+            sport, dport = self._next_ports()
+            endpoint = self._send_and_capture_endpoint(sport, dport)
+            if endpoint is None:
+                no_response += 1
+                continue
+            if endpoint in forbidden_set:
+                forbidden_hits[endpoint] += 1
+            else:
+                valid_hits += 1
+            if (i + 1) % 100 == 0:
+                logger.info(
+                    f"  sent {i + 1}/{self.num_packets} flows, "
+                    f"valid_hits={valid_hits}, forbidden_hits={forbidden_hits}, "
+                    f"no_response={no_response}"
+                )
+
+        logger.info(
+            f"verify_endpoint_unreachable done: valid_hits={valid_hits}, "
+            f"forbidden_hits={forbidden_hits}, no_response={no_response}"
+        )
+
+        offenders = {ep: c for ep, c in forbidden_hits.items() if c > 0}
+        assert not offenders, (
+            f"Forbidden endpoint(s) received traffic (route update was "
+            f"unexpectedly accepted by hardware): {offenders}"
+        )
+        assert valid_hits > 0, (
+            f"No flows landed on any allowed endpoint "
+            f"({len(valid_set)} configured, {no_response} flows had no response)"
+        )
 
     def _conflicting_dest_prefix(self):
         """
@@ -614,6 +709,9 @@ class VxlanTunnelFgEcmpTest(BaseTest):
             return
         if self.test_case == "verify_mac_vni":
             self._verify_mac_vni()
+            return
+        if self.test_case == "verify_endpoint_unreachable":
+            self._verify_endpoint_unreachable()
             return
 
         if self.test_case == "create_flows":

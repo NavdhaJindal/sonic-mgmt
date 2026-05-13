@@ -22,7 +22,20 @@ VNET2_VNI = 2000
 ROUTE_OVERRIDE_VNI = 5001
 PREFIX = "150.0.3.1/24"
 BUCKET_SIZE = 512
+# Larger bucket count used by the scale tests. The hardware caps the actual
+# number of programmed buckets at MAX_HW_BUCKET_SIZE (511), but the route
+# entry can still be configured with a larger logical bucket size and the
+# orchagent / SAI layer is expected to clamp it.
+BUCKET_SIZE_LARGE = 2048
+# Hardware-supported maximum number of FG ECMP buckets. Adding endpoints
+# beyond this should be rejected by the DUT (the new endpoint never
+# receives traffic).
+MAX_HW_BUCKET_SIZE = 511
 NUM_INITIAL_ENDPOINTS = 10
+# Endpoint counts used by the scale tests.
+LARGE_ENDPOINT_COUNT = 128
+MAX_ENDPOINT_COUNT = MAX_HW_BUCKET_SIZE       # 511 -- still fits in HW
+OVERFLOW_ENDPOINT_COUNT = MAX_HW_BUCKET_SIZE + 1  # 512 -- one too many
 ENDPOINT_BASE_IP = "100.0.1."
 VNET2_ENDPOINT_BASE_IP = "100.0.2."
 VNET2_DUT_IP = "202.0.1.1"
@@ -46,6 +59,25 @@ ecmp_utils = Ecmp_Utils()
 
 def generate_endpoint_list(base_ip=ENDPOINT_BASE_IP, count=NUM_INITIAL_ENDPOINTS):
     return [f"{base_ip}{i}" for i in range(count)]
+
+
+def generate_large_endpoint_list(count, base_prefix="100.10"):
+    """
+    Generate `count` distinct IPv4 endpoints by walking the third and fourth
+    octets of base_prefix.X.Y. Used by the scale tests that need more
+    endpoints than fit in a single /24.
+    """
+    endpoints = []
+    third = 0
+    fourth = 1   # avoid .0
+    while len(endpoints) < count:
+        endpoints.append(f"{base_prefix}.{third}.{fourth}")
+        fourth += 1
+        if fourth > 254:
+            fourth = 1
+            third += 1
+            assert third <= 255, f"Cannot generate {count} endpoints in {base_prefix}.0.0/16"
+    return endpoints
 
 
 def get_loopback_ip(cfg_facts):
@@ -114,8 +146,11 @@ def set_route_tunnel_regular(duthost, endpoints):
     time.sleep(3)
 
 
-def set_route_tunnel(duthost, endpoints):
-    logger.info(f"Programming route {PREFIX} -> {','.join(endpoints)}")
+def set_route_tunnel(duthost, endpoints, bucket_size=BUCKET_SIZE):
+    logger.info(
+        f"Programming route {PREFIX} -> {len(endpoints)} endpoints, "
+        f"buckets={bucket_size}"
+    )
     vni_str = ",".join([str(VNI)] * len(endpoints))
     apply_chunk(
         duthost,
@@ -123,7 +158,7 @@ def set_route_tunnel(duthost, endpoints):
             f"{VNET_NAME}|{PREFIX}": {
                 "endpoint": ",".join(endpoints),
                 "vni": vni_str,
-                "consistent_hashing_buckets": str(BUCKET_SIZE),
+                "consistent_hashing_buckets": str(bucket_size),
             }
         }},
         "route_tunnel",
@@ -167,6 +202,23 @@ def cleanup(duthost, ptfhost):
     config_reload(duthost, safe_reload=True, check_intf_up_ports=True)
     for f in [PERSIST_MAP_FILE, PTF_PARAMS_FILE, PTF_LOG_FILE]:
         ptfhost.shell(f"rm -f {f}")
+
+
+def get_t1_facing_ptf_ports(duthost, tbinfo):
+    """Return PTF port indices of DUT interfaces facing T1 BGP neighbors.
+
+    Used to validate that VXLAN-encapped packets egress only on uplinks.
+    """
+    minigraph_facts = duthost.get_extended_minigraph_facts(tbinfo)
+    ptf_indices = minigraph_facts["minigraph_ptf_indices"]
+    neighbors = minigraph_facts["minigraph_neighbors"]
+    t1_ports = sorted({
+        ptf_indices[intf]
+        for intf, info in neighbors.items()
+        if info.get("name", "").endswith("T1") and intf in ptf_indices
+    })
+    logger.info(f"T1-facing PTF port indices: {t1_ports}")
+    return t1_ports
 
 
 def vxlan_setup_one_vnet(duthost, ptfhost, tbinfo, cfg_facts,
@@ -214,6 +266,8 @@ def vxlan_setup_one_vnet(duthost, ptfhost, tbinfo, cfg_facts,
     set_route_tunnel(duthost, initial_endpoints)
     time.sleep(3)
 
+    expected_egress_ports = get_t1_facing_ptf_ports(duthost, tbinfo)
+
     return {
         "dut_vtep": dut_vtep,
         "ptf_src_ip": ptf_ip,
@@ -223,6 +277,7 @@ def vxlan_setup_one_vnet(duthost, ptfhost, tbinfo, cfg_facts,
         "vxlan_port": vxlan_port,
         "ptf_port_name": ptf_port_name,
         "ingress_if": ingress_if,
+        "expected_egress_ports": expected_egress_ports,
     }
 
 
@@ -334,11 +389,30 @@ def run_regular_ecmp_ptf_test(ptfhost, endpoints, params, num_packets):
     )
 
 
-def run_vxlan_ptf_test(ptfhost, endpoints, params, test_case, num_packets, **kwargs):
-    logger.info(f"PTF test: test_case={test_case}, endpoints={len(endpoints)}, flows={num_packets}")
+def run_vxlan_ptf_test(ptfhost, endpoints, params, test_case, num_packets,
+                       check_distribution=True, require_all_endpoints_hit=True,
+                       **kwargs):
+    """
+    `check_distribution` controls whether expected flows-per-endpoint values
+    are sent to PTF (and the deviation check runs). Disable it for the scale
+    tests where the flow:endpoint ratio is too low for meaningful deviation.
 
-    flows_per_nh = NUM_FLOWS / len(endpoints)
-    exp_flow_count = {ep: flows_per_nh for ep in endpoints}
+    `require_all_endpoints_hit` controls the strict assertion that every
+    configured endpoint received at least one flow. With many endpoints and
+    relatively few flows it is statistically expected that some endpoints
+    receive zero flows, so disable it for the scale tests.
+    """
+    logger.info(
+        f"PTF test: test_case={test_case}, endpoints={len(endpoints)}, "
+        f"flows={num_packets}, check_distribution={check_distribution}, "
+        f"require_all_endpoints_hit={require_all_endpoints_hit}"
+    )
+
+    if check_distribution:
+        flows_per_nh = num_packets / len(endpoints)
+        exp_flow_count = {ep: flows_per_nh for ep in endpoints}
+    else:
+        exp_flow_count = {}
 
     ptf_params = params.copy()
 
@@ -347,6 +421,7 @@ def run_vxlan_ptf_test(ptfhost, endpoints, params, test_case, num_packets, **kwa
         "test_case": test_case,
         "num_packets": num_packets,
         "exp_flow_count": exp_flow_count,
+        "require_all_endpoints_hit": require_all_endpoints_hit,
         "persist_map": PERSIST_MAP_FILE,
     })
     ptf_params.update(kwargs)
@@ -422,6 +497,112 @@ def test_vxlan_fg_ecmp(ptfhost, common_setup_teardown):
         vnet2_endpoints=vnet2_endpoints,
         ptf_ingress_port_vnet2=vnet2["ptf_ingress_port"],
         ptf_src_ip_vnet2=vnet2["ptf_src_ip"],
+    )
+
+
+def test_vxlan_fg_ecmp_2048_buckets_128_endpoints(ptfhost, common_setup_teardown):
+    """
+    Scale test: 2048 logical buckets with 128 endpoints.
+
+    With 1000 flows spread across 128 endpoints (~8 flows/endpoint) the
+    flow:endpoint ratio is too low for a meaningful even-distribution check,
+    so we only validate that:
+      - traffic is forwarded (no flow loss)
+      - every captured flow lands on a configured endpoint
+      - consistent hashing holds: replaying the same flows hits the same
+        endpoints as before
+    """
+    logger.info("Running test_vxlan_fg_ecmp_2048_buckets_128_endpoints")
+    setup, duthost, _ = common_setup_teardown
+
+    endpoints = generate_large_endpoint_list(LARGE_ENDPOINT_COUNT)
+    set_route_tunnel(duthost, endpoints, bucket_size=BUCKET_SIZE_LARGE)
+
+    run_vxlan_ptf_test(
+        ptfhost, endpoints, setup, "create_flows",
+        num_packets=NUM_FLOWS,
+        check_distribution=False,
+        require_all_endpoints_hit=False,
+    )
+    run_vxlan_ptf_test(
+        ptfhost, endpoints, setup, "verify_consistent_hash",
+        num_packets=NUM_FLOWS,
+        check_distribution=False,
+        require_all_endpoints_hit=False,
+    )
+
+
+def test_vxlan_fg_ecmp_2048_buckets_511_endpoints(ptfhost, common_setup_teardown):
+    """
+    Scale test: 2048 logical buckets with MAX_ENDPOINT_COUNT (511) endpoints
+    -- the largest endpoint count the hardware can program (HW caps at 511
+    buckets). Same lighter-weight assertions as the 128-endpoint scale test.
+    """
+    logger.info("Running test_vxlan_fg_ecmp_2048_buckets_511_endpoints")
+    setup, duthost, _ = common_setup_teardown
+
+    endpoints = generate_large_endpoint_list(MAX_ENDPOINT_COUNT)
+    set_route_tunnel(duthost, endpoints, bucket_size=BUCKET_SIZE_LARGE)
+
+    run_vxlan_ptf_test(
+        ptfhost, endpoints, setup, "create_flows",
+        num_packets=NUM_FLOWS,
+        check_distribution=False,
+        require_all_endpoints_hit=False,
+    )
+    run_vxlan_ptf_test(
+        ptfhost, endpoints, setup, "verify_consistent_hash",
+        num_packets=NUM_FLOWS,
+        check_distribution=False,
+        require_all_endpoints_hit=False,
+    )
+
+
+def test_vxlan_fg_ecmp_2048_buckets_512th_endpoint_rejected(ptfhost, common_setup_teardown):
+    """
+    Negative scale test: with 2048 logical buckets configured the hardware
+    still caps the actual bucket count at MAX_HW_BUCKET_SIZE (511). Adding a
+    512th endpoint is therefore expected to be rejected: traffic should
+    continue to be forwarded only to the original 511 endpoints, and the
+    512th (overflow) endpoint should never receive a flow.
+
+    Test flow:
+      1. Program 511 endpoints with bucket_size=2048; verify traffic forwards.
+      2. Add a 512th endpoint via the same VNET_ROUTE_TUNNEL entry.
+      3. Send fresh flows; assert the overflow endpoint receives 0 flows
+         while the original 511 continue to receive traffic.
+    """
+    logger.info("Running test_vxlan_fg_ecmp_2048_buckets_512th_endpoint_rejected")
+    setup, duthost, _ = common_setup_teardown
+
+    base_endpoints = generate_large_endpoint_list(MAX_ENDPOINT_COUNT)
+    set_route_tunnel(duthost, base_endpoints, bucket_size=BUCKET_SIZE_LARGE)
+
+    # Sanity: the 511-endpoint configuration is functional before we attempt
+    # to push past the hardware limit.
+    run_vxlan_ptf_test(
+        ptfhost, base_endpoints, setup, "create_flows",
+        num_packets=NUM_FLOWS,
+        check_distribution=False,
+        require_all_endpoints_hit=False,
+    )
+
+    # Add the 512th (overflow) endpoint. The hardware cannot accommodate it,
+    # so the configuration write succeeds at the CONFIG_DB level but the
+    # endpoint must never appear in the forwarding decision.
+    overflow_endpoints = generate_large_endpoint_list(OVERFLOW_ENDPOINT_COUNT)
+    overflow_endpoint = overflow_endpoints[-1]
+    assert overflow_endpoint not in base_endpoints, (
+        "overflow_endpoint must be the new 512th endpoint"
+    )
+    set_route_tunnel(duthost, overflow_endpoints, bucket_size=BUCKET_SIZE_LARGE)
+
+    run_vxlan_ptf_test(
+        ptfhost, overflow_endpoints, setup, "verify_endpoint_unreachable",
+        num_packets=NUM_FLOWS,
+        check_distribution=False,
+        require_all_endpoints_hit=False,
+        forbidden_endpoints=[overflow_endpoint],
     )
 
 
