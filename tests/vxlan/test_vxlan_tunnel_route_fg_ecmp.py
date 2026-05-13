@@ -166,11 +166,12 @@ def vxlan_setup_one_vnet(duthost, ptfhost, tbinfo, cfg_facts,
     ptfhost.shell(f"ip addr add {ptf_ip}/24 dev {ptf_port_name}")
     ptfhost.shell(f"ip link set {ptf_port_name} up")
 
+    ecmp_utils.configure_vxlan_switch(duthost, vxlan_port=vxlan_port,
+                                      dutmac=duthost.facts["router_mac"])
+
     initial_endpoints = generate_endpoint_list()
     set_route_tunnel(duthost, initial_endpoints)
     time.sleep(3)
-
-    ecmp_utils.configure_vxlan_switch(duthost, vxlan_port=vxlan_port)
 
     return {
         "dut_vtep": dut_vtep,
