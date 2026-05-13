@@ -14,6 +14,10 @@ Test cases:
 - conflicting_dest_prefix: Send flows from two separate VNET ingress ports that both
   have the same destination prefix but different VNIs. Asserts that Vnet1 flows
   reach only Vnet1 endpoints and Vnet2 flows reach only Vnet2 endpoints
+- verify_mac_vni: Send flows after the route is programmed with a per-endpoint
+  mac_address list and an explicit override vni. Asserts that for every captured
+  VXLAN packet the outer VNI matches the override vni and the inner Ethernet dst
+  MAC matches the mac configured for that endpoint.
 """
 
 import logging
@@ -23,9 +27,21 @@ import json
 import ptf
 import ptf.packet as scapy
 from ptf.base_tests import BaseTest
-from ptf.testutils import test_params_get, dp_poll, send_packet, simple_tcp_packet
+from ptf.mask import Mask
+from ptf.testutils import (
+    test_params_get,
+    dp_poll,
+    send_packet,
+    simple_tcp_packet,
+    simple_vxlan_packet,
+)
 
 MAX_DEVIATION = 0.12
+
+# Arbitrary placeholder MAC for fields the DUT picks (next-hop neighbor MAC,
+# inner Ether dst when no mac_address override is configured). Marked
+# don't-care in every Mask so its value never has to be correct.
+_PLACEHOLDER_MAC = "00:aa:bb:cc:dd:ee"
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +60,7 @@ class VxlanTunnelFgEcmpTest(BaseTest):
         self.endpoints = params.get("endpoints", [])
         self.dst_ip = params.get("dst_ip")
         self.src_ip = params.get("ptf_src_ip")
+        self.dut_vtep = params.get("dut_vtep")
         self.router_mac = params.get("router_mac")
         self.num_packets = int(params.get("num_packets", 1000))
         self.vxlan_port = int(params.get("vxlan_port", 4789))
@@ -58,6 +75,12 @@ class VxlanTunnelFgEcmpTest(BaseTest):
         _port2 = params.get("ptf_ingress_port_vnet2")
         self.ptf_ingress_port_vnet2 = int(_port2) if _port2 is not None else None
         self.ptf_src_ip_vnet2 = params.get("ptf_src_ip_vnet2")
+
+        # mac_address / vni override verification params
+        _expected_vni = params.get("expected_vni")
+        self.expected_vni = int(_expected_vni) if _expected_vni is not None else None
+        # endpoint_to_mac is a dict {endpoint_ip: mac_string} (lowercase MACs preferred)
+        self.endpoint_to_mac = params.get("endpoint_to_mac", {})
 
         self.tcp_sport = 1234
         self.tcp_dport = 5000
@@ -88,17 +111,7 @@ class VxlanTunnelFgEcmpTest(BaseTest):
         valid_endpoints = self.endpoints if valid_endpoints is None else valid_endpoints
 
         src_mac = self.dataplane.get_mac(0, send_port)
-        pkt = simple_tcp_packet(
-            eth_dst=self.router_mac,
-            eth_src=src_mac,
-            ip_dst=self.dst_ip,
-            ip_src=src_ip,
-            ip_id=105,
-            ip_ttl=64,
-            tcp_sport=sport,
-            tcp_dport=dport,
-            pktlen=100,
-        )
+        pkt = self._build_inner_tcp(sport, dport, src_mac, src_ip)
         send_packet(self, send_port, pkt)
 
         deadline = time.time() + 2.0
@@ -126,6 +139,62 @@ class VxlanTunnelFgEcmpTest(BaseTest):
             return outer_dst if outer_dst in valid_endpoints else None
 
         return None
+
+    def _build_inner_tcp(self, sport, dport, src_mac, src_ip):
+        """Build the inner TCP packet that PTF sends into the DUT."""
+        return simple_tcp_packet(
+            eth_dst=self.router_mac,
+            eth_src=src_mac,
+            ip_dst=self.dst_ip,
+            ip_src=src_ip,
+            ip_id=105,
+            ip_ttl=64,
+            tcp_sport=sport,
+            tcp_dport=dport,
+            pktlen=100,
+        )
+
+    def _build_expected_for_endpoint(self, inner_pkt, endpoint, vni, inner_dst_mac):
+        """
+        Build a Mask describing the expected VXLAN-encapped packet for a flow
+        that the DUT is sending to `endpoint` with outer VNI `vni` and inner
+        Ethernet dst MAC `inner_dst_mac`.
+
+        Mirrors verify_mac_vni_encap in vxlan_ecmp_ptftest.py: copy the sent
+        inner packet, mutate the fields the DUT rewrites during encap (inner
+        Ether src/dst, inner IP TTL), and wrap as inner_frame of a
+        simple_vxlan_packet. Outer fields the DUT/network may vary
+        (next-hop MAC, IP id/ttl/chksum, UDP sport) are marked don't-care.
+        """
+        inner_exp = inner_pkt.copy()
+        inner_exp[scapy.Ether].src = self.router_mac
+        inner_exp[scapy.Ether].dst = inner_dst_mac
+        inner_exp[scapy.IP].ttl -= 1
+
+        encap = simple_vxlan_packet(
+            eth_src=self.router_mac,
+            eth_dst=_PLACEHOLDER_MAC,
+            ip_src=self.dut_vtep,
+            ip_dst=endpoint,
+            ip_id=0,
+            ip_ttl=128,
+            udp_sport=12345,
+            udp_dport=self.vxlan_port,
+            with_udp_chksum=False,
+            vxlan_vni=vni,
+            inner_frame=inner_exp,
+        )
+        encap[scapy.IP].flags = 0x2
+
+        m = Mask(encap)
+        m.set_ignore_extra_bytes()
+        m.set_do_not_care_scapy(scapy.Ether, "src")
+        m.set_do_not_care_scapy(scapy.Ether, "dst")
+        m.set_do_not_care_scapy(scapy.IP, "ttl")
+        m.set_do_not_care_scapy(scapy.IP, "id")
+        m.set_do_not_care_scapy(scapy.IP, "chksum")
+        m.set_do_not_care_scapy(scapy.UDP, "sport")
+        return m
 
     def _check_distribution(self, hit_count_map):
         deviation_max = 0.0
@@ -310,6 +379,100 @@ class VxlanTunnelFgEcmpTest(BaseTest):
             f"(threshold: {MAX_DEVIATION:.0%})"
         )
 
+    def _verify_mac_vni(self):
+        """
+        After the route is reprogrammed with a per-endpoint mac_address list and
+        an explicit override vni, send num_packets distinct flows. For each one:
+          1. dp_poll for the encapsulated VXLAN packet
+          2. identify which endpoint the DUT picked via outer IP.dst
+          3. build a Mask whose inner Ether dst is the mac configured for that
+             endpoint and whose outer VNI is the override vni
+          4. assert mask.pkt_match(received_pkt)
+
+        Mirrors verify_mac_vni_encap in vxlan_ecmp_ptftest.py.
+        """
+        assert self.expected_vni is not None, "expected_vni param is required"
+        assert self.endpoint_to_mac, "endpoint_to_mac param is required"
+        assert self.dut_vtep, "dut_vtep param is required to build expected packet"
+
+        # Normalize configured MACs to lowercase for the Mask constructor.
+        endpoint_to_mac_norm = {ep: mac.lower() for ep, mac in self.endpoint_to_mac.items()}
+        for ep in self.endpoints:
+            assert ep in endpoint_to_mac_norm, f"No mac_address configured for endpoint {ep}"
+
+        src_mac = self.dataplane.get_mac(0, self.send_port)
+        endpoint_hits = {ep: 0 for ep in self.endpoints}
+        mismatch_count = 0
+        no_response = 0
+
+        self.tcp_sport = 1234
+        self.tcp_dport = 5000
+
+        for i in range(self.num_packets):
+            sport, dport = self._next_ports()
+            inner = self._build_inner_tcp(sport, dport, src_mac, self.src_ip)
+            send_packet(self, self.send_port, inner)
+
+            matched = False
+            deadline = time.time() + 2.0
+            while time.time() < deadline:
+                remaining = deadline - time.time()
+                res = dp_poll(self, device_number=0, timeout=min(remaining, 1.0))
+                if not isinstance(res, self.dataplane.PollSuccess):
+                    break
+
+                pkt = scapy.Ether(res.packet)
+                if scapy.IP not in pkt or scapy.UDP not in pkt:
+                    continue
+                if pkt[scapy.UDP].dport != self.vxlan_port:
+                    continue
+                outer_dst = pkt[scapy.IP].dst
+                if outer_dst not in self.endpoints:
+                    logger.error(f"Received VXLAN pkt to unexpected endpoint {outer_dst}")
+                    continue
+
+                expected_mac = endpoint_to_mac_norm[outer_dst]
+                exp = self._build_expected_for_endpoint(
+                    inner, outer_dst, self.expected_vni, expected_mac,
+                )
+
+                if exp.pkt_match(pkt):
+                    endpoint_hits[outer_dst] += 1
+                    matched = True
+                    break
+
+                mismatch_count += 1
+                logger.error(
+                    f"Packet mismatch for endpoint={outer_dst}, "
+                    f"expected_mac={expected_mac}, expected_vni={self.expected_vni}.\n"
+                    f"\nExpected:\n{exp}\n\nReceived:\n{pkt}\n"
+                )
+                break
+
+            if not matched and mismatch_count == 0:
+                no_response += 1
+
+            if (i + 1) % 100 == 0:
+                logger.info(
+                    f"  verified {i + 1}/{self.num_packets} flows, "
+                    f"hits={endpoint_hits} mismatches={mismatch_count} "
+                    f"no_response={no_response}"
+                )
+
+        logger.info(
+            f"verify_mac_vni done: hits={endpoint_hits} "
+            f"mismatches={mismatch_count} no_response={no_response}"
+        )
+
+        assert mismatch_count == 0, (
+            f"{mismatch_count} packet(s) did not match expected MAC/VNI encapsulation"
+        )
+        assert no_response < self.num_packets, (
+            f"All {self.num_packets} flows produced no VXLAN response"
+        )
+        missing = [ep for ep, c in endpoint_hits.items() if c == 0]
+        assert not missing, f"No packets observed for endpoints: {missing}"
+
     def _conflicting_dest_prefix(self):
         """
         Send flows from each VNET's ingress port and verify that:
@@ -372,6 +535,9 @@ class VxlanTunnelFgEcmpTest(BaseTest):
     def runTest(self):
         if self.test_case == "conflicting_dest_prefix":
             self._conflicting_dest_prefix()
+            return
+        if self.test_case == "verify_mac_vni":
+            self._verify_mac_vni()
             return
 
         if self.test_case == "create_flows":

@@ -16,8 +16,12 @@ VNET2_NAME = "Vnet2"
 TUNNEL_NAME = "tunnel_v4"
 VNI = 1000
 VNET2_VNI = 2000
+# Override VNI used by the per-route mac_address / vni test. Different from the
+# VNET vni so we can confirm the route-level vni overrides the VNET vni when
+# building the VXLAN encap header.
+ROUTE_OVERRIDE_VNI = 5001
 PREFIX = "150.0.3.1/24"
-BUCKET_SIZE = 512 # todo navdhaj: check that should configure 511
+BUCKET_SIZE = 512
 NUM_INITIAL_ENDPOINTS = 10
 ENDPOINT_BASE_IP = "100.0.1."
 VNET2_ENDPOINT_BASE_IP = "100.0.2."
@@ -119,6 +123,37 @@ def set_route_tunnel(duthost, endpoints):
             f"{VNET_NAME}|{PREFIX}": {
                 "endpoint": ",".join(endpoints),
                 "vni": vni_str,
+                "consistent_hashing_buckets": str(BUCKET_SIZE),
+            }
+        }},
+        "route_tunnel",
+    )
+    time.sleep(3)
+
+
+def set_route_tunnel_with_mac_vni(duthost, endpoints, mac_list, vni):
+    """
+    Program the FG ECMP route with a per-endpoint mac_address list and an
+    explicit override vni (applied to every endpoint). The mac_list and
+    endpoints lists must have the same length. Removes any stale fields so
+    sonic-cfggen merges produce the exact intended state.
+    """
+    assert len(mac_list) == len(endpoints), (
+        f"mac_list length {len(mac_list)} must equal endpoints length {len(endpoints)}"
+    )
+    logger.info(
+        f"Programming FG ECMP route {PREFIX} with vni={vni}, "
+        f"endpoints={endpoints}, mac_list={mac_list}"
+    )
+    vni_str = ",".join([str(vni)] * len(endpoints))
+    mac_str = ",".join(mac_list)
+    apply_chunk(
+        duthost,
+        {"VNET_ROUTE_TUNNEL": {
+            f"{VNET_NAME}|{PREFIX}": {
+                "endpoint": ",".join(endpoints),
+                "vni": vni_str,
+                "mac_address": mac_str,
                 "consistent_hashing_buckets": str(BUCKET_SIZE),
             }
         }},
@@ -379,6 +414,51 @@ def test_vxlan_fg_ecmp(ptfhost, common_setup_teardown):
         ptf_ingress_port_vnet2=vnet2["ptf_ingress_port"],
         ptf_src_ip_vnet2=vnet2["ptf_src_ip"],
     )
+
+
+def test_vxlan_fg_ecmp_mac_vni(ptfhost, common_setup_teardown):
+    """
+    Validate that mac_address and vni configured on a VNET_ROUTE_TUNNEL entry
+    are used as the inner Ethernet dst MAC and outer VXLAN VNI of the
+    encapsulated packets.
+
+    A unique MAC is programmed per endpoint and an override VNI distinct from
+    the VNET vni is used so any fallback to the VNET vni will be caught.
+
+    The mac_address field is explicitly deleted in finally — sonic-cfggen
+    merges fields, so without an hdel it would leak into subsequent tests
+    that program the route without a mac_address.
+    """
+    logger.info("Running test_vxlan_fg_ecmp_mac_vni")
+    setup, duthost, _ = common_setup_teardown
+
+    endpoints = generate_endpoint_list()
+    # Deterministic, unique MACs (one per endpoint).
+    mac_list = [
+        f"52:54:00:{i // 256:02x}:{i % 256:02x}:aa" for i in range(len(endpoints))
+    ]
+    endpoint_to_mac = dict(zip(endpoints, mac_list))
+
+    set_route_tunnel_with_mac_vni(duthost, endpoints, mac_list, ROUTE_OVERRIDE_VNI)
+    try:
+        run_vxlan_ptf_test(
+            ptfhost,
+            endpoints,
+            setup,
+            "verify_mac_vni",
+            num_packets=NUM_FLOWS,
+            expected_vni=ROUTE_OVERRIDE_VNI,
+            endpoint_to_mac=endpoint_to_mac,
+        )
+    finally:
+        # sonic-cfggen merges fields, so explicitly drop mac_address from
+        # CONFIG_DB so subsequent tests' set_route_tunnel calls (which do not
+        # set mac_address) start from a clean slate. The vni and endpoints
+        # will be overwritten by the next test's own set_route_tunnel call.
+        duthost.shell(
+            f"sonic-db-cli CONFIG_DB hdel "
+            f"'VNET_ROUTE_TUNNEL|{VNET_NAME}|{PREFIX}' mac_address"
+        )
 
 
 def test_transition_regular_to_fg_ecmp(ptfhost, common_setup_teardown):
